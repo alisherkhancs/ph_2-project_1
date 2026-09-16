@@ -40,35 +40,65 @@ reader = load_ocr_reader()
 plate_cascade = load_haar_cascade()
 
 # ==========================================
-# 3. ENHANCED OCR PREPROCESSING PIPELINE
+# 3. OCR PREPROCESSING & DISAMBIGUATION
 # ==========================================
+def clean_plate_text(raw_text):
+    """
+    Cleans OCR output and resolves common character ambiguities:
+    - Strips unwanted non-alphanumeric noise.
+    - Fixes broken loop misclassifications (e.g. 'J' misread for '0'/'O' in 'VJ16' -> 'V016').
+    """
+    cleaned = re.sub(r'[^A-Za-z0-9 ]', '', raw_text).strip().upper()
+    tokens = cleaned.split()
+
+    fixed_tokens = []
+    for token in tokens:
+        t = token
+        # Replace 'J' when placed between an initial letter and numbers (e.g. 'VJ16' -> 'V016')
+        t = re.sub(r'(^[A-Z])J(\d)', r'\g<1>0\2', t)
+        # Replace leading 'J' before numbers if misread
+        t = re.sub(r'^J(\d{2,})', r'0\1', t)
+        fixed_tokens.append(t)
+
+    return " ".join(fixed_tokens)
+
 def preprocess_and_read_plate(crop, ocr_reader):
     """
-    Advanced OCR preprocessing & Left-to-Right Geometric Sorting:
-    1. Resizes/upscales the cropped plate to enhance character stroke definition.
-    2. Converts to grayscale and applies CLAHE for balanced local contrast.
-    3. Applies Bilateral Filtering to eliminate background speckles while retaining sharp edges.
-    4. Evaluates multi-pass representations (Enhanced Grayscale, Resized, Otsu Threshold).
-    5. Sorts all detected character blocks strictly from LEFT to RIGHT.
-    6. Filters invalid noise and characters using an alphanumeric allowlist.
+    Enhanced OCR preprocessing & Left-to-Right Geometric Reading:
+    1. Cubic upscaling to optimal character stroke resolution.
+    2. Unsharp masking + CLAHE for balanced contrast and closed character loops.
+    3. Morphological closing to repair broken '0'/'O' curves.
+    4. Left-to-right geometric sorting of detected text blocks.
+    5. Disambiguation filter for license plate alphanumeric formatting.
     """
     if crop is None or crop.size == 0:
         return "", 0.0
 
     img_h, img_w = crop.shape[:2]
-    # Upscale crop so height is at least 180px for optimal neural net feature extraction
+    # Upscale crop so height is at least 180px
     scale = max(2.0, 200.0 / img_h) if img_h > 0 else 2.5
     resized = cv2.resize(crop, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
     gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
+
+    # Contrast enhancement & unsharp masking
+    blurred = cv2.GaussianBlur(gray, (0, 0), 3.0)
+    unsharp = cv2.addWeighted(gray, 1.5, blurred, -0.5, 0)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    enhanced = clahe.apply(unsharp)
     denoised = cv2.bilateralFilter(enhanced, 7, 50, 50)
+
+    # Morphological closing to seal open loops in digits/letters
+    adaptive_thresh = cv2.adaptiveThreshold(
+        denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 9
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    closed_thresh = cv2.morphologyEx(adaptive_thresh, cv2.MORPH_CLOSE, kernel)
 
     passes = [
         ("Enhanced Grayscale", denoised),
-        ("Original Resized", resized),
-        ("Otsu Threshold", cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1])
+        ("Adaptive Morph Closed", closed_thresh),
+        ("Original Resized", resized)
     ]
 
     best_text = ""
@@ -79,12 +109,15 @@ def preprocess_and_read_plate(crop, ocr_reader):
             img_pass,
             allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ",
             paragraph=False,
-            detail=1
+            detail=1,
+            contrast_ths=0.1,
+            adjust_contrast=0.7,
+            mag_ratio=1.5
         )
         if not results:
             continue
 
-        # CRUCIAL: Sort all detected text fragments strictly from LEFT to RIGHT by min-x coordinate
+        # Sort all detected text fragments strictly from LEFT to RIGHT by min-x coordinate
         sorted_res = sorted(results, key=lambda r: min(pt[0] for pt in r[0]))
         text_parts = []
         conf_parts = []
@@ -96,14 +129,16 @@ def preprocess_and_read_plate(crop, ocr_reader):
                 conf_parts.append(conf)
 
         if text_parts:
-            full_text = " ".join(text_parts).upper()
+            raw_text = " ".join(text_parts).upper()
+            processed_text = clean_plate_text(raw_text)
             avg_conf = float(np.mean(conf_parts))
-            if avg_conf > best_conf and len(re.sub(r'[^A-Za-z0-9]', '', full_text)) >= 2:
-                best_conf = avg_conf
-                best_text = full_text
 
-        # Early exit if high confidence reading is achieved
-        if best_conf > 0.60 and len(re.sub(r'[^A-Za-z0-9]', '', best_text)) >= 4:
+            if avg_conf > best_conf and len(re.sub(r'[^A-Za-z0-9]', '', processed_text)) >= 2:
+                best_conf = avg_conf
+                best_text = processed_text
+
+        # Early exit if strong reading is achieved
+        if best_conf > 0.65 and len(re.sub(r'[^A-Za-z0-9]', '', best_text)) >= 4:
             break
 
     return best_text, best_conf
