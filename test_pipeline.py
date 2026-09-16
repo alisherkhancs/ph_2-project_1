@@ -4,45 +4,127 @@ import numpy as np
 import os
 import re
 
+def preprocess_and_read_plate(crop, reader):
+    """
+    Optimized OCR preprocessing and left-to-right reading:
+    1. Upscale crop to optimal character height (180px - 300px).
+    2. Convert to grayscale + apply CLAHE for balanced contrast.
+    3. Bilateral filter for noise reduction without blurring edges.
+    4. EasyOCR reading with alphanumeric allowlist.
+    5. Left-to-right geometric sorting of detected text fragments.
+    """
+    if crop is None or crop.size == 0:
+        return "", 0.0
+
+    img_h, img_w = crop.shape[:2]
+    # Upscale crop so height is at least 180px
+    scale = max(2.0, 200.0 / img_h) if img_h > 0 else 2.5
+    resized = cv2.resize(crop, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    denoised = cv2.bilateralFilter(enhanced, 7, 50, 50)
+
+    # First pass: Enhanced Grayscale
+    passes = [
+        ("Enhanced Grayscale", denoised),
+        ("Original Resized", resized),
+        ("Otsu Threshold", cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1])
+    ]
+
+    best_text = ""
+    best_conf = 0.0
+
+    for name, img_pass in passes:
+        results = reader.readtext(
+            img_pass,
+            allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ",
+            paragraph=False,
+            detail=1
+        )
+        if not results:
+            continue
+
+        # Sort all detected text fragments strictly from LEFT to RIGHT
+        sorted_res = sorted(results, key=lambda r: min(pt[0] for pt in r[0]))
+        text_parts = []
+        conf_parts = []
+
+        for bbox, txt, conf in sorted_res:
+            clean = re.sub(r'[^A-Za-z0-9]', '', txt)
+            if clean and conf > 0.15:
+                text_parts.append(clean)
+                conf_parts.append(conf)
+
+        if text_parts:
+            full_text = " ".join(text_parts).upper()
+            avg_conf = float(np.mean(conf_parts))
+            if avg_conf > best_conf and len(re.sub(r'[^A-Za-z0-9]', '', full_text)) >= 2:
+                best_conf = avg_conf
+                best_text = full_text
+
+        # Early exit if we already have a strong reading
+        if best_conf > 0.60 and len(re.sub(r'[^A-Za-z0-9]', '', best_text)) >= 4:
+            break
+
+    return best_text, best_conf
+
 def detect_and_crop_plate_robust(image, reader, plate_cascade=None):
     img_h, img_w = image.shape[:2]
     candidates = []
 
-    # 1. EasyOCR direct text localization (Finds exact text boxes on vehicle)
-    # EasyOCR's CRAFT detector locates text regions in natural scene images
+    # 1. EasyOCR direct text localization
     ocr_full = reader.readtext(image)
-    for bbox, text, conf in ocr_full:
-        clean_t = re.sub(r'[^A-Za-z0-9]', '', text)
-        if len(clean_t) >= 2 and conf > 0.15:
-            # bbox is [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
-            pts = np.array(bbox, dtype=np.int32)
-            bx, by, bw, bh = cv2.boundingRect(pts)
-            # Add padding around the text to capture the full plate border
-            pad_x = int(bw * 0.25)
-            pad_y = int(bh * 0.35)
-            px = max(0, bx - pad_x)
-            py = max(0, by - pad_y)
-            pw = min(img_w - px, bw + 2 * pad_x)
-            ph = min(img_h - py, bh + 2 * pad_y)
-            candidates.append(((px, py, pw, ph), "OCR Text Localization", text, conf))
+    if ocr_full:
+        # Sort full image detections left-to-right
+        sorted_ocr = sorted(ocr_full, key=lambda r: min(pt[0] for pt in r[0]))
+        # Combine nearby bounding boxes if they form a multi-word plate
+        plate_boxes = []
+        for bbox, text, conf in sorted_ocr:
+            clean_t = re.sub(r'[^A-Za-z0-9]', '', text)
+            if len(clean_t) >= 2 and conf > 0.15:
+                pts = np.array(bbox, dtype=np.int32)
+                bx, by, bw, bh = cv2.boundingRect(pts)
+                plate_boxes.append((bx, by, bw, bh))
+
+        if plate_boxes:
+            # Union of detected plate text bounding boxes
+            min_x = max(0, min(b[0] for b in plate_boxes))
+            min_y = max(0, min(b[1] for b in plate_boxes))
+            max_x = min(img_w, max(b[0] + b[2] for b in plate_boxes))
+            max_y = min(img_h, max(b[1] + b[3] for b in plate_boxes))
+
+            pw = max_x - min_x
+            ph = max_y - min_y
+
+            # Pad bounding box to include the full license plate frame
+            pad_x = int(pw * 0.25)
+            pad_y = int(ph * 0.40)
+            px = max(0, min_x - pad_x)
+            py = max(0, min_y - pad_y)
+            pw_padded = min(img_w - px, pw + 2 * pad_x)
+            ph_padded = min(img_h - py, ph + 2 * pad_y)
+
+            candidates.append(((px, py, pw_padded, ph_padded), "OCR Scene Localization"))
 
     # 2. Haar Cascade candidates
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     if plate_cascade is not None:
         haar_boxes = plate_cascade.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=2, minSize=(40, 15))
         for (hx, hy, hw, hh) in haar_boxes:
-            candidates.append(((hx, hy, hw, hh), "Haar Cascade Classifier", "", 0.0))
+            candidates.append(((int(hx), int(hy), int(hw), int(hh)), "Haar Cascade Classifier"))
 
     # 3. Contour analysis candidates
     bfilter = cv2.bilateralFilter(gray, 11, 17, 17)
     edged = cv2.Canny(bfilter, 30, 200)
     contours, _ = cv2.findContours(edged, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:30]
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:15]
     for cnt in contours:
         cx, cy, cw, ch = cv2.boundingRect(cnt)
         aspect_ratio = cw / float(ch)
-        if cy > img_h * 0.25 and 1.8 <= aspect_ratio <= 6.0 and 1200 <= (cw * ch) <= (img_w * img_h * 0.25):
-            candidates.append(((cx, cy, cw, ch), "Contour Analysis", "", 0.0))
+        if cy > img_h * 0.25 and 1.8 <= aspect_ratio <= 6.0 and 1500 <= (cw * ch) <= (img_w * img_h * 0.25):
+            candidates.append(((int(cx), int(cy), int(cw), int(ch)), "Contour Analysis"))
 
     best_crop = None
     best_box = None
@@ -50,11 +132,10 @@ def detect_and_crop_plate_robust(image, reader, plate_cascade=None):
     best_score = -1.0
     best_method = ""
 
-    # Evaluate each candidate crop
+    # Evaluate candidates
     seen_boxes = set()
-    for (x, y, w, h), method, initial_text, initial_conf in candidates:
-        # Avoid duplicate evaluations of nearly identical boxes
-        box_key = (x // 10, y // 10, w // 10, h // 10)
+    for (x, y, w, h), method in candidates[:6]:
+        box_key = (x // 15, y // 15, w // 15, h // 15)
         if box_key in seen_boxes:
             continue
         seen_boxes.add(box_key)
@@ -63,31 +144,14 @@ def detect_and_crop_plate_robust(image, reader, plate_cascade=None):
         if crop.size == 0:
             continue
 
-        # If we already have OCR text from full image localization, use it
-        if initial_text and initial_conf > 0.3:
-            raw_text = initial_text
-            conf = initial_conf
-        else:
-            # Run OCR on the crop
-            crop_results = reader.readtext(crop)
-            if crop_results:
-                raw_text = " ".join([r[1] for r in crop_results]).strip()
-                conf = np.mean([r[2] for r in crop_results])
-            else:
-                raw_text = ""
-                conf = 0.0
-
+        raw_text, conf = preprocess_and_read_plate(crop, reader)
         clean_text = re.sub(r'[^A-Za-z0-9]', '', raw_text)
         text_len = len(clean_text)
 
-        # Plate scoring logic:
-        # - Alphanumeric characters count (plates have 3-10 chars)
-        # - Has both letters and digits -> bonus
-        # - OCR confidence
         has_letters = bool(re.search(r'[A-Za-z]', clean_text))
         has_digits = bool(re.search(r'[0-9]', clean_text))
 
-        score = conf * 2.0
+        score = conf * 3.0
         if 3 <= text_len <= 10:
             score += 3.0
             if has_letters and has_digits:
@@ -99,7 +163,6 @@ def detect_and_crop_plate_robust(image, reader, plate_cascade=None):
         else:
             score -= 2.0
 
-        # Preference for realistic plate aspect ratio (2.0 to 5.0)
         ar = w / float(h)
         if 2.0 <= ar <= 5.5:
             score += 1.0
